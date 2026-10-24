@@ -1,0 +1,250 @@
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <USB.h>
+#include <USBHIDKeyboard.h>
+#include <TOTP.h>
+#include <Base32.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include "time.h"
+
+// Hardware-Pin für den LilyGo T-Dongle S3
+#define BUTTON_PIN 0
+
+// --- KONFIGURATION ---
+// 1. Dein Heim-WLAN (für NTP-Zeitsynchronisation nach dem Entsperren)
+const char* homeSsid     = "DEIN_HEIM_WLAN_NAME";
+const char* homePassword = "DEIN_HEIM_WLAN_PASSWORT";
+const char* ntpServer    = "pool.ntp.org";
+
+// 2. Konfiguration des temporären Setup-Access-Points (AP) des Sticks
+const char* apSsid       = "TOTP-Token-Setup";
+const char* apPassword   = "geheimes_ap_passwort"; // Mindestens 8 Zeichen (WPA2)
+
+// 3. Deine PIN zum Entsperren über die Web-Oberfläche
+const char* targetPin    = "9753"; 
+
+// Account-Namen
+const char* accountNames[] = {"GITHUB", "GOOGLE"};
+// Standard-Geheimnisse (werden beim ersten Start sicher ins NVS geschrieben)
+const char* defaultSecrets[] = {"JBSWY3DPEHPK3PXP", "MZXW6YTBOI======"}; 
+const int NUM_ACCOUNTS = 2;
+
+// --- VARIABLEN & OBJEKTE ---
+TFT_eSPI tft = TFT_eSPI();
+USBHIDKeyboard Keyboard;
+Base32 base32;
+Preferences preferences;
+WebServer server(80);
+
+bool pinVerified = false;
+uint8_t masterKeys[2][32];
+int keyLengths[2];
+TOTP* totp[2];
+
+int currentAccount = 0;
+unsigned long lastMillis = 0;
+time_t currentUnixTime = 0;
+
+// HTML-Seite für die PIN-Eingabe
+const char* htmlLoginPage = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TOTP Token Entsperrung</title>
+    <style>
+        body { font-family: sans-serif; background: #121212; color: #fff; text-align: center; padding-top: 50px; }
+        .card { background: #1e1e1e; padding: 30px; border-radius: 10px; display: inline-block; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        input[type="password"] { font-size: 24px; padding: 10px; width: 220px; text-align: center; border-radius: 5px; border: 1px solid #444; background: #2e2e2e; color: #fff; }
+        input[type="submit"] { font-size: 20px; padding: 10px 20px; margin-top: 15px; background: #d4af37; border: none; border-radius: 5px; color: #000; font-weight: bold; cursor: pointer; }
+        input[type="submit"]:hover { background: #f3c642; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>TOTP Hardware Token</h2>
+        <p>Bitte PIN eingeben:</p>
+        <form action="/verify" method="POST">
+            <input type="password" name="pin" pattern="[0-9]*" inputmode="numeric" autocomplete="current-password" required autofocus><br>
+            <input type="submit" value="Entsperren">
+        </form>
+    </div>
+</body>
+</html>
+)";
+
+// Hilfsfunktion für Textausgabe auf dem Display
+void displayMessage(const char* title, const char* msg, uint32_t color = TFT_WHITE) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_GOLD, TFT_BLACK);
+    tft.drawString(title, 10, 10);
+    tft.setTextSize(2);
+    tft.setTextColor(color, TFT_BLACK);
+    tft.drawString(msg, 10, 40);
+}
+
+// 1. AP-Modus & Webserver zur PIN-Eingabe starten
+void captivePortalLogin() {
+    WiFi.softAP(apSsid, apPassword);
+    IPAddress IP = WiFi.softAPIP();
+
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_GOLD, TFT_BLACK);
+    tft.drawString("WLAN AP aktiv:", 10, 10);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(apSsid, 10, 35);
+    tft.drawString("IP: 192.168.4.1", 10, 60);
+
+    server.on("/", HTTP_GET, []() {
+        server.send(200, "text/html", htmlLoginPage);
+    });
+
+    server.on("/verify", HTTP_POST, []() {
+        if (server.hasArg("pin")) {
+            String entered = server.arg("pin");
+            if (entered == targetPin) {
+                pinVerified = true;
+                server.send(200, "text/html", "<html><body style='background:#121212;color:#fff;text-align:center;padding-top:50px;'><h2>Erfolgreich entsperrt!</h2><p>Du kannst dieses Fenster jetzt schliessen.</p></body></html>");
+            } else {
+                server.send(200, "text/html", "<html><body style='background:#121212;color:#fff;text-align:center;padding-top:50px;'><h2>Falsche PIN!</h2><a href='/' style='color:#d4af37;'>Erneut versuchen</a></body></html>");
+            }
+        } else {
+            server.send(400, "text/plain", "Bad Request");
+        }
+    });
+
+    server.begin();
+
+    // Warten, bis die PIN korrekt eingegeben wurde
+    while (!pinVerified) {
+        server.handleClient();
+        delay(2);
+    }
+
+    server.stop();
+    WiFi.softAPdisconnect(true);
+}
+
+// 2. Heim-WLAN & NTP Zeitsynchronisation
+void syncTimeWiFi() {
+    displayMessage("Heim-WLAN", "Verbinde...", TFT_YELLOW);
+    WiFi.begin(homeSsid, homePassword);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+        delay(500);
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        displayMessage("NTP Sync", "Hole Zeit...", TFT_YELLOW);
+        configTime(0, 0, ntpServer);
+        
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            currentUnixTime = time(NULL);
+            displayMessage("Erfolg", "Zeit synchron!", TFT_GREEN);
+            delay(1000);
+        } else {
+            displayMessage("Fehler", "NTP Timeout!", TFT_RED);
+            delay(2000);
+        }
+    } else {
+        displayMessage("Fehler", "Kein WLAN!", TFT_RED);
+        delay(2000);
+    }
+    
+    // WLAN komplett abschalten (Sicherheit & Stromsparen)
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+}
+
+void setup() {
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    tft.init();
+    tft.setRotation(3);
+    tft.fillScreen(TFT_BLACK);
+
+    // 1. Erst AP starten und auf Web-PIN warten
+    captivePortalLogin();
+
+    // 2. Nach erfolgreicher PIN ins Heim-WLAN verbinden und Zeit holen
+    syncTimeWiFi();
+
+    // 3. Secrets sicher aus dem NVS laden (oder beim Erststart initialisieren)
+    Preferences prefs;
+    prefs.begin("totp_store", false);
+    for(int i = 0; i < NUM_ACCOUNTS; i++) {
+        String prefKey = "secret_" + String(i);
+        String secretStr = "";
+        
+        if(!prefs.isKey(prefKey.c_str())) {
+            prefs.putString(prefKey.c_str(), defaultSecrets[i]);
+            secretStr = defaultSecrets[i];
+        } else {
+            secretStr = prefs.getString(prefKey.c_str(), defaultSecrets[i]);
+        }
+        
+        keyLengths[i] = base32.fromBase32((uint8_t*)secretStr.c_str(), secretStr.length(), masterKeys[i]);
+        totp[i] = new TOTP(masterKeys[i], keyLengths[i]);
+    }
+    prefs.end();
+
+    Keyboard.begin();
+    USB.begin();
+    lastMillis = millis();
+}
+
+void loop() {
+    unsigned long nowMillis = millis();
+    if (nowMillis - lastMillis >= 1000) {
+        currentUnixTime += (nowMillis - lastMillis) / 1000;
+        lastMillis = nowMillis;
+    }
+
+    char* totpCode = totp[currentAccount]->getCode(currentUnixTime);
+    int secondsLeft = 30 - (currentUnixTime % 30);
+
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_GOLD, TFT_BLACK);
+    tft.drawString(accountNames[currentAccount], 10, 10);
+    
+    tft.setTextSize(3);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(totpCode, 10, 32);
+
+    int barWidth = map(secondsLeft, 0, 30, 0, 140);
+    tft.fillRect(10, 65, barWidth, 6, TFT_GREEN);
+    tft.fillRect(10 + barWidth, 65, 140 - barWidth, 6, TFT_BLACK);
+
+    if (digitalRead(BUTTON_PIN) == LOW) {
+        unsigned long pressStart = millis();
+        delay(50); 
+        
+        while (digitalRead(BUTTON_PIN) == LOW) {
+            delay(10);
+        }
+        unsigned long pressDuration = millis() - pressStart;
+
+        if (pressDuration > 1000) {
+            // Langer Druck: Code eintippen
+            tft.fillRect(10, 65, 140, 6, TFT_BLUE);
+            Keyboard.print(totpCode);
+            Keyboard.press(KEY_RETURN);
+            Keyboard.releaseAll();
+            delay(500);
+        } else if (pressDuration > 50) {
+            // Kurzer Druck: Account wechseln
+            currentAccount = (currentAccount + 1) % NUM_ACCOUNTS;
+            tft.fillScreen(TFT_BLACK); 
+        }
+    }
+
+    delay(100);
+}
